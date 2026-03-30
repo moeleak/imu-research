@@ -57,6 +57,10 @@
   $
 ]
 
+#text(size: 0.9em)[
+  where $a_t$ denotes linear acceleration, $omega_t$ denotes angular velocity, $r_t$ and $p_t$ denote roll and pitch, and $||a_t||_2$ denotes acceleration magnitude.
+]
+
 
 == Mathematical Formulation
 
@@ -67,6 +71,10 @@
       theta_t &= psi_t + b + t delta
     $
   ]
+  
+  #text(size: 0.85em)[
+    where $d_t$ is the displacement target, $p_t$ is the ground-truth position, $psi_t$ is the smoothed yaw, and $b$ and $delta$ denote heading bias and drift.
+  ]
 ][
   #align(center)[
     $
@@ -74,6 +82,10 @@
       Delta y_t &= hat(d)_t sin theta_t \
       hat(p)_t &= hat(p)_(t-1) + (Delta x_t, Delta y_t)
     $
+  ]
+  
+  #text(size: 0.85em)[
+    where $hat(d)_t$ is the predicted displacement, $Delta x_t$ and $Delta y_t$ are trajectory increments, and $hat(p)_t$ is the reconstructed position.
   ]
 ]
 
@@ -112,6 +124,10 @@
   $
 ]
 
+#text(size: 0.9em)[
+  where $y_t$ denotes the supervision label, and the label is defined as scalar displacement $d_t$ instead of Cartesian coordinates.
+]
+
 - Scalar displacement is used as the supervision target.
 - Temporal links inject stride-scale continuity into prediction.
 - The inductive bias is motion-aware rather than coordinate-aware.
@@ -126,12 +142,20 @@
       tilde(d)_t &= (1 - z_t) hat(d)_t
     $
   ]
+  
+  #text(size: 0.85em)[
+    where $v_t$ is a local motion-variance measure, $tau$ is the static threshold, $z_t$ is the static indicator, and $tilde(d)_t$ is the ZUPT-filtered prediction.
+  ]
 ][
   #align(center)[
     $
       L &= 1/T sum_(t=1)^T rho(hat(d)_t - d_t) \
       L_s &= 1/T sum_(t=1)^T rho(tilde(d)_t - d_t)
     $
+  ]
+  
+  #text(size: 0.85em)[
+    where $rho$ denotes the robust regression penalty, $L$ is the basic training loss, and $L_s$ is the loss after static suppression.
   ]
 ]
 
@@ -234,4 +258,3 @@
 - The comparison shows a clear progression from fixed-step heuristics to temporal and graph-based models that better capture human motion regularity.
 - The methodological lesson is that a good inductive bias matters: step-scale targets, temporal continuity, and motion-aware reconstruction are all crucial.
 - Future work can extend this study with joint heading and displacement prediction, uncertainty-aware trajectory fusion, cross-device evaluation, and a full numeric benchmark table.
-
