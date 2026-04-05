@@ -3,44 +3,24 @@ from __future__ import annotations
 import argparse
 import json
 import random
-import sys
-from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import torch
-import torch.nn as nn
 from matplotlib.collections import PolyCollection
-from scipy.signal import find_peaks, savgol_filter
-from torch.utils.data import DataLoader
 
 
 CODE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CODE_DIR.parent
-MODELS_DIR = CODE_DIR / "models"
-for import_dir in (MODELS_DIR, CODE_DIR):
-    if str(import_dir) not in sys.path:
-        sys.path.insert(0, str(import_dir))
-
-from lp_ar_pdr_v10 import (
-    OxIODSpeedDataset as ArCnnDataset,
-    SpeedNet as ArCnnModel,
-    generate_trajectory_vectorized as generate_arcnn_trajectory,
-)
-from mlp_pdr import OxIODSpeedDataset as MlpDataset, SpeedNet as MlpModel
-from pdr_v13_lstm import (
-    OxIODLSTMScalarDataset as LstmDataset,
-    Scalar_LSTM,
-)
+from models.baseline import evaluate_baseline
+from models.common import LossHistory, load_sequence_data
+from models.lp_ar_pdr_v10 import evaluate_arcnn_model, train_arcnn_model
+from models.mlp_pdr import evaluate_mlp_model, train_mlp_model
+from models.pdr_v13_lstm import evaluate_lstm_model, train_lstm_model
 
 try:
-    from gnn_pdr import (
-        OxIODGNNDataset,
-        PyGDataLoader,
-        Scalar_GNN,
-    )
+    from models.gnn_pdr import evaluate_gnn_model, train_gnn_model
 
     HAS_GNN = True
     GNN_IMPORT_ERROR: Exception | None = None
@@ -58,28 +38,6 @@ MODEL_COLORS = {
 
 MODEL_RENDER_ORDER = ["GNN", "LSTM", "AR-CNN", "CNN"]
 DISPLAY_MAX_EPOCH = 20
-
-
-@dataclass(frozen=True)
-class LossHistory:
-    train: list[float]
-    val: list[float]
-
-
-@dataclass
-class TrainedArtifact:
-    model: torch.nn.Module
-    stats: dict[str, np.ndarray]
-    history: LossHistory | None = None
-
-
-@dataclass
-class SequenceData:
-    yaws: np.ndarray
-    yaws_smooth: np.ndarray
-    acc_mag: np.ndarray
-    gt_pos: np.ndarray
-    feat_all: np.ndarray
 
 
 def save_history(history: dict[str, LossHistory], output_path: Path) -> None:
@@ -244,454 +202,6 @@ def resolve_dataset_root(dataset_root_arg: str) -> Path:
     return (CODE_DIR / candidate).resolve()
 
 
-def average_loss(losses: list[float]) -> float:
-    return float(np.mean(losses)) if losses else float("nan")
-
-
-def evaluate_tensor_loader(
-    model: torch.nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> float:
-    model.eval()
-    losses: list[float] = []
-    with torch.no_grad():
-        for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
-            losses.append(float(criterion(model(x), y).item()))
-    return average_loss(losses)
-
-
-def evaluate_graph_loader(
-    model: torch.nn.Module,
-    loader: PyGDataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> float:
-    model.eval()
-    losses: list[float] = []
-    with torch.no_grad():
-        for data in loader:
-            data = data.to(device)
-            losses.append(float(criterion(model(data), data.y).item()))
-    return average_loss(losses)
-
-
-def train_mlp_model(
-    dataset_root: Path,
-    category: str,
-    device: torch.device,
-    epochs: int,
-    batch_size: int,
-    num_workers: int,
-) -> TrainedArtifact:
-    train_set = MlpDataset(str(dataset_root), category, mode="train")
-    val_set = MlpDataset(str(dataset_root), category, mode="test", stats=train_set.stats)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-
-    model = MlpModel().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    criterion = nn.HuberLoss()
-    train_history: list[float] = []
-    val_history: list[float] = []
-
-    for epoch in range(epochs):
-        model.train()
-        losses: list[float] = []
-        for x, y in train_loader:
-            x = x.to(device)
-            y = y.to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(x), y)
-            loss.backward()
-            optimizer.step()
-            losses.append(float(loss.item()))
-
-        train_loss = average_loss(losses)
-        val_loss = evaluate_tensor_loader(model, val_loader, criterion, device)
-        train_history.append(train_loss)
-        val_history.append(val_loss)
-        print(f"MLP   Epoch {epoch + 1:02d}/{epochs:02d} | train={train_loss:.6f} | val={val_loss:.6f}")
-
-    return TrainedArtifact(model=model, stats=train_set.stats, history=LossHistory(train_history, val_history))
-
-
-def train_arcnn_model(
-    dataset_root: Path,
-    category: str,
-    device: torch.device,
-    epochs: int,
-    batch_size: int,
-    num_workers: int,
-) -> TrainedArtifact:
-    train_set = ArCnnDataset(str(dataset_root), category, mode="train")
-    val_set = ArCnnDataset(str(dataset_root), category, mode="test", stats=train_set.stats)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-
-    model = ArCnnModel().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    criterion = nn.HuberLoss()
-    train_history: list[float] = []
-    val_history: list[float] = []
-
-    for epoch in range(epochs):
-        model.train()
-        losses: list[float] = []
-        for x, y in train_loader:
-            x = x.to(device)
-            y = y.to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(x), y)
-            loss.backward()
-            optimizer.step()
-            losses.append(float(loss.item()))
-        train_loss = average_loss(losses)
-        val_loss = evaluate_tensor_loader(model, val_loader, criterion, device)
-        train_history.append(train_loss)
-        val_history.append(val_loss)
-        print(f"ARCNN Epoch {epoch + 1:02d}/{epochs:02d} | train={train_loss:.6f} | val={val_loss:.6f}")
-
-    return TrainedArtifact(model=model, stats=train_set.stats, history=LossHistory(train_history, val_history))
-
-
-def train_lstm_model(
-    dataset_root: Path,
-    category: str,
-    device: torch.device,
-    epochs: int,
-    batch_size: int,
-    num_workers: int,
-) -> TrainedArtifact:
-    train_set = LstmDataset(str(dataset_root), category, mode="train", seq_len=100)
-    val_set = LstmDataset(str(dataset_root), category, mode="test", seq_len=100, stats=train_set.stats)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers)
-
-    model = Scalar_LSTM().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    criterion = nn.HuberLoss()
-    train_history: list[float] = []
-    val_history: list[float] = []
-
-    for epoch in range(epochs):
-        model.train()
-        losses: list[float] = []
-        for x, y in train_loader:
-            x = x.to(device)
-            y = y.to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(x), y)
-            loss.backward()
-            optimizer.step()
-            losses.append(float(loss.item()))
-
-        train_loss = average_loss(losses)
-        val_loss = evaluate_tensor_loader(model, val_loader, criterion, device)
-        train_history.append(train_loss)
-        val_history.append(val_loss)
-        print(f"LSTM  Epoch {epoch + 1:02d}/{epochs:02d} | train={train_loss:.6f} | val={val_loss:.6f}")
-
-    return TrainedArtifact(model=model, stats=train_set.stats, history=LossHistory(train_history, val_history))
-
-
-def train_gnn_model(
-    dataset_root: Path,
-    category: str,
-    device: torch.device,
-    epochs: int,
-    batch_size: int,
-) -> TrainedArtifact:
-    if not HAS_GNN:
-        raise RuntimeError(
-            "GNN training requires torch_geometric in the current environment."
-        ) from GNN_IMPORT_ERROR
-
-    train_set = OxIODGNNDataset(str(dataset_root), category, mode="train")
-    val_set = OxIODGNNDataset(str(dataset_root), category, mode="test", stats=train_set.stats)
-    train_loader = PyGDataLoader(train_set, batch_size=batch_size, shuffle=True)
-    val_loader = PyGDataLoader(val_set, batch_size=batch_size, shuffle=False)
-
-    model = Scalar_GNN(input_dim=11).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    criterion = nn.HuberLoss()
-    train_history: list[float] = []
-    val_history: list[float] = []
-
-    for epoch in range(epochs):
-        model.train()
-        losses: list[float] = []
-        for data in train_loader:
-            data = data.to(device)
-            optimizer.zero_grad()
-            loss = criterion(model(data), data.y)
-            loss.backward()
-            optimizer.step()
-            losses.append(float(loss.item()))
-
-        train_loss = average_loss(losses)
-        val_loss = evaluate_graph_loader(model, val_loader, criterion, device)
-        train_history.append(train_loss)
-        val_history.append(val_loss)
-        print(f"GNN   Epoch {epoch + 1:02d}/{epochs:02d} | train={train_loss:.6f} | val={val_loss:.6f}")
-
-    return TrainedArtifact(model=model, stats=train_set.stats, history=LossHistory(train_history, val_history))
-
-
-def load_sequence_data(dataset_root: Path, category: str, sequence: str) -> SequenceData:
-    base = dataset_root / category / sequence / "syn"
-    imu_df = pd.read_csv(base / "imu1.csv", header=None).iloc[::4, :].reset_index(drop=True)
-    gt_df = pd.read_csv(base / "vi1.csv", header=None).iloc[::4, :].reset_index(drop=True)
-    min_len = min(len(imu_df), len(gt_df))
-    imu_df = imu_df.iloc[:min_len].reset_index(drop=True)
-    gt_df = gt_df.iloc[:min_len].reset_index(drop=True)
-
-    yaws = imu_df.iloc[:, 3].values
-    yaws_smooth = np.arctan2(
-        savgol_filter(np.sin(yaws), 51, 3),
-        savgol_filter(np.cos(yaws), 51, 3),
-    )
-    acc_mag = np.linalg.norm(imu_df.iloc[:, 4:7].values, axis=1)
-    gt_pos = gt_df.iloc[:, 2:4].values - gt_df.iloc[0, 2:4].values
-    roll = imu_df.iloc[:, 1].values
-    pitch = imu_df.iloc[:, 2].values
-    feat_all = np.hstack(
-        [
-            imu_df.iloc[:, 4:10].values,
-            np.sin(roll[:, None]),
-            np.cos(roll[:, None]),
-            np.sin(pitch[:, None]),
-            np.cos(pitch[:, None]),
-            acc_mag[:, None],
-        ]
-    ).astype(np.float32)
-
-    return SequenceData(
-        yaws=yaws,
-        yaws_smooth=yaws_smooth,
-        acc_mag=acc_mag,
-        gt_pos=gt_pos,
-        feat_all=feat_all,
-    )
-
-
-def evaluate_baseline(sequence_data: SequenceData) -> tuple[np.ndarray, float]:
-    acc_mag_f = savgol_filter(sequence_data.acc_mag, 11, 3)
-    peaks, _ = find_peaks(acc_mag_f, height=0.6, distance=14)
-    yaws_smooth = np.arctan2(
-        savgol_filter(np.sin(sequence_data.yaws), 31, 3),
-        savgol_filter(np.cos(sequence_data.yaws), 31, 3),
-    )
-
-    pred_pos = np.zeros_like(sequence_data.gt_pos)
-    curr_x = 0.0
-    curr_y = 0.0
-    step_ptr = 0
-    for index in range(len(sequence_data.gt_pos)):
-        if step_ptr < len(peaks) and index == peaks[step_ptr]:
-            curr_x += 0.7 * np.cos(yaws_smooth[index])
-            curr_y += 0.7 * np.sin(yaws_smooth[index])
-            step_ptr += 1
-        pred_pos[index] = [curr_x, curr_y]
-
-    best_rmse = float("inf")
-    best_pred = pred_pos
-    for angle in np.linspace(0, 2 * np.pi, 360):
-        cosine = np.cos(angle)
-        sine = np.sin(angle)
-        rotation = np.array([[cosine, -sine], [sine, cosine]])
-        candidate = (rotation @ pred_pos.T).T
-        rmse = np.sqrt(np.mean(np.sum((candidate - sequence_data.gt_pos) ** 2, axis=1)))
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best_pred = candidate
-    return best_pred, best_rmse
-
-
-def evaluate_mlp(
-    artifact: TrainedArtifact,
-    sequence_data: SequenceData,
-    device: torch.device,
-) -> tuple[np.ndarray, float]:
-    artifact.model.eval()
-    pred_speeds: list[float] = []
-    with torch.no_grad():
-        for index in range(0, len(sequence_data.feat_all) - 30, 10):
-            normalized = (sequence_data.feat_all[index : index + 20] - artifact.stats["mean"]) / artifact.stats["std"]
-            x_tensor = torch.from_numpy(normalized).float().unsqueeze(0).to(device)
-            speed = float(artifact.model(x_tensor).cpu().numpy()[0, 0] / 20.0)
-            if np.std(sequence_data.acc_mag[index : index + 20]) < 0.06:
-                speed = 0.0
-            pred_speeds.append(speed)
-
-    best_rmse = float("inf")
-    best_traj = None
-    for trial_bias in np.linspace(0, 2 * np.pi, 360):
-        current = np.array([0.0, 0.0])
-        trajectory = [current.copy()]
-        scale_fix = 0.90
-        drift_fix = -0.000015
-        for step_index, speed in enumerate(pred_speeds):
-            t_index = step_index * 10
-            theta = sequence_data.yaws_smooth[t_index + 20] + trial_bias + (t_index * drift_fix)
-            current += [(speed * scale_fix) * np.cos(theta), (speed * scale_fix) * np.sin(theta)]
-            for _ in range(10):
-                trajectory.append(current.copy())
-        traj_array = np.array(trajectory)
-        eval_len = min(len(traj_array), len(sequence_data.gt_pos))
-        rmse = np.sqrt(np.mean(np.sum((traj_array[:eval_len] - sequence_data.gt_pos[:eval_len]) ** 2, axis=1)))
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best_traj = traj_array
-    return best_traj, best_rmse
-
-
-def evaluate_arcnn(
-    artifact: TrainedArtifact,
-    sequence_data: SequenceData,
-    device: torch.device,
-) -> tuple[np.ndarray, float]:
-    artifact.model.eval()
-    pred_speeds: list[float] = []
-    sampled_yaws: list[float] = []
-    with torch.no_grad():
-        for index in range(0, len(sequence_data.feat_all) - 30, 10):
-            normalized = (sequence_data.feat_all[index : index + 20] - artifact.stats["mean"]) / artifact.stats["std"]
-            x_tensor = torch.from_numpy(normalized).float().unsqueeze(0).to(device)
-            speed = float(artifact.model(x_tensor).cpu().numpy()[0, 0] / 20.0)
-            if np.std(sequence_data.acc_mag[index : index + 20]) < 0.05:
-                speed = 0.0
-            pred_speeds.append(speed)
-            sampled_yaws.append(sequence_data.yaws_smooth[index + 20])
-
-    pred_speeds_arr = np.array(pred_speeds)
-    sampled_yaws_arr = np.array(sampled_yaws)
-    best_coarse_bias = 0.0
-    best_rmse = float("inf")
-
-    for bias in np.linspace(0, 2 * np.pi, 360):
-        traj = generate_arcnn_trajectory(pred_speeds_arr, sampled_yaws_arr, bias, 1.0, 0.0)
-        eval_len = min(len(traj), len(sequence_data.gt_pos))
-        rmse = np.sqrt(np.mean(np.sum((traj[:eval_len] - sequence_data.gt_pos[:eval_len]) ** 2, axis=1)))
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best_coarse_bias = bias
-
-    best_traj = None
-    for bias in np.linspace(best_coarse_bias - np.radians(10), best_coarse_bias + np.radians(10), 100):
-        for scale in np.linspace(0.85, 1.05, 21):
-            for drift in np.linspace(-3e-5, 3e-5, 11):
-                traj = generate_arcnn_trajectory(pred_speeds_arr, sampled_yaws_arr, bias, scale, drift)
-                eval_len = min(len(traj), len(sequence_data.gt_pos))
-                rmse = np.sqrt(np.mean(np.sum((traj[:eval_len] - sequence_data.gt_pos[:eval_len]) ** 2, axis=1)))
-                if rmse < best_rmse:
-                    best_rmse = rmse
-                    best_traj = traj
-    return best_traj, best_rmse
-
-
-def align_lstm_trajectory(
-    speeds: np.ndarray,
-    yaws: np.ndarray,
-    gt_pos: np.ndarray,
-) -> tuple[np.ndarray, float]:
-    def generate_traj(bias: float, scale: float, drift: float) -> np.ndarray:
-        t_indices = np.arange(len(speeds))
-        thetas = yaws[: len(speeds)] + bias + (t_indices * drift)
-        dx = (speeds * scale) * np.cos(thetas)
-        dy = (speeds * scale) * np.sin(thetas)
-        traj_x = np.cumsum(np.insert(dx, 0, 0.0))
-        traj_y = np.cumsum(np.insert(dy, 0, 0.0))
-        return np.stack([traj_x, traj_y], axis=1)
-
-    best_coarse_bias = 0.0
-    best_rmse = float("inf")
-    for bias in np.linspace(0, 2 * np.pi, 120):
-        traj = generate_traj(bias, 1.0, 0.0)
-        eval_len = min(len(traj), len(gt_pos))
-        rmse = np.sqrt(np.mean(np.sum((traj[:eval_len] - gt_pos[:eval_len]) ** 2, axis=1)))
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best_coarse_bias = bias
-
-    best_traj = None
-    for bias in np.linspace(best_coarse_bias - np.radians(10), best_coarse_bias + np.radians(10), 100):
-        for scale in np.linspace(0.85, 1.05, 21):
-            for drift in np.linspace(-3e-5, 3e-5, 11):
-                traj = generate_traj(bias, scale, drift)
-                eval_len = min(len(traj), len(gt_pos))
-                rmse = np.sqrt(np.mean(np.sum((traj[:eval_len] - gt_pos[:eval_len]) ** 2, axis=1)))
-                if rmse < best_rmse:
-                    best_rmse = rmse
-                    best_traj = traj
-    return best_traj, best_rmse
-
-
-def evaluate_lstm(
-    artifact: TrainedArtifact,
-    sequence_data: SequenceData,
-    device: torch.device,
-) -> tuple[np.ndarray, float]:
-    artifact.model.eval()
-    normalized = (sequence_data.feat_all - artifact.stats["mean"]) / artifact.stats["std"]
-    x_tensor = torch.from_numpy(normalized[:-1]).float().unsqueeze(0).to(device)
-    with torch.no_grad():
-        pred_seq = artifact.model(x_tensor).cpu().numpy()[0, :, 0] / 100.0
-    for index in range(len(pred_seq)):
-        start = max(0, index - 10)
-        end = min(len(sequence_data.acc_mag), index + 10)
-        if np.std(sequence_data.acc_mag[start:end]) < 0.05:
-            pred_seq[index] = 0.0
-    return align_lstm_trajectory(pred_seq, sequence_data.yaws_smooth, sequence_data.gt_pos)
-
-
-def evaluate_gnn(
-    artifact: TrainedArtifact,
-    sequence_data: SequenceData,
-    device: torch.device,
-) -> tuple[np.ndarray, float]:
-    if not HAS_GNN:
-        raise RuntimeError("Cannot evaluate GNN without torch_geometric.") from GNN_IMPORT_ERROR
-
-    artifact.model.eval()
-    feat_norm = (sequence_data.feat_all - artifact.stats["mean"]) / artifact.stats["std"]
-    x_tensor = torch.tensor(feat_norm, dtype=torch.float32).to(device)
-    edge_start = torch.arange(0, len(feat_norm) - 1)
-    edge_end = torch.arange(1, len(feat_norm))
-    edge_index = torch.stack([torch.cat([edge_start, edge_end]), torch.cat([edge_end, edge_start])], dim=0).to(device)
-
-    from torch_geometric.data import Data
-
-    test_data = Data(x=x_tensor, edge_index=edge_index).to(device)
-    with torch.no_grad():
-        pred_speeds = artifact.model(test_data).cpu().numpy().flatten() / 100.0
-    for index in range(len(pred_speeds)):
-        start = max(0, index - 10)
-        end = min(len(sequence_data.acc_mag), index + 10)
-        if np.std(sequence_data.acc_mag[start:end]) < 0.05:
-            pred_speeds[index] = 0.0
-
-    best_rmse = float("inf")
-    best_traj = None
-    for bias in np.linspace(0, 2 * np.pi, 60):
-        traj = np.stack(
-            [
-                np.cumsum(np.insert((pred_speeds * np.cos(sequence_data.yaws_smooth[: len(pred_speeds)] + bias)), 0, 0.0)),
-                np.cumsum(np.insert((pred_speeds * np.sin(sequence_data.yaws_smooth[: len(pred_speeds)] + bias)), 0, 0.0)),
-            ],
-            axis=1,
-        )
-        eval_len = min(len(traj), len(sequence_data.gt_pos))
-        rmse = np.sqrt(np.mean(np.sum((traj[:eval_len] - sequence_data.gt_pos[:eval_len]) ** 2, axis=1)))
-        if rmse < best_rmse:
-            best_rmse = rmse
-            best_traj = traj
-    return best_traj, best_rmse
-
-
 def save_trajectory_plot(
     output_path: Path,
     gt_pos: np.ndarray,
@@ -700,7 +210,9 @@ def save_trajectory_plot(
     axis_limits: tuple[float, float, float, float],
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(7.2, 7.2))
+    # Use a portrait canvas so side-by-side slides show more of the actual path
+    # instead of spending width on empty margins.
+    fig, ax = plt.subplots(figsize=(5.6, 7.6))
     ax.plot(gt_pos[:, 0], gt_pos[:, 1], color="#0B8F1C", linewidth=2.5, label="Ground Truth")
     ax.plot(pred_pos[:, 0], pred_pos[:, 1], color="#F25F5C", linewidth=1.6, linestyle="--", alpha=0.95, label="Prediction")
     ax.set_xlabel("X (m)")
@@ -719,8 +231,8 @@ def save_trajectory_plot(
         va="top",
         bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "edgecolor": "#C9D6DE", "alpha": 0.95},
     )
-    fig.subplots_adjust(left=0.12, right=0.98, bottom=0.11, top=0.92)
-    fig.savefig(output_path, dpi=220, facecolor="white")
+    fig.subplots_adjust(left=0.10, right=0.99, bottom=0.08, top=0.93)
+    fig.savefig(output_path, dpi=220, facecolor="white", bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
 
 
@@ -782,6 +294,8 @@ def main() -> None:
         args.num_workers,
     )
 
+    if not HAS_GNN:
+        raise RuntimeError("GNN training requires torch_geometric in the current environment.") from GNN_IMPORT_ERROR
     gnn_artifact = train_gnn_model(
         dataset_root,
         args.category,
@@ -792,11 +306,10 @@ def main() -> None:
 
     print("\n== Generating Trajectory Figures ==")
     baseline_traj, baseline_rmse = evaluate_baseline(sequence_data)
-    mlp_traj, mlp_rmse = evaluate_mlp(mlp_artifact, sequence_data, device)
-    arcnn_traj, arcnn_rmse = evaluate_arcnn(arcnn_artifact, sequence_data, device)
-    lstm_traj, lstm_rmse = evaluate_lstm(lstm_artifact, sequence_data, device)
-
-    gnn_traj, gnn_rmse = evaluate_gnn(gnn_artifact, sequence_data, device)
+    mlp_traj, mlp_rmse = evaluate_mlp_model(mlp_artifact, sequence_data, device)
+    arcnn_traj, arcnn_rmse = evaluate_arcnn_model(arcnn_artifact, sequence_data, device)
+    lstm_traj, lstm_rmse = evaluate_lstm_model(lstm_artifact, sequence_data, device)
+    gnn_traj, gnn_rmse = evaluate_gnn_model(gnn_artifact, sequence_data, device)
     trajectories = [sequence_data.gt_pos, baseline_traj, mlp_traj, arcnn_traj, lstm_traj, gnn_traj]
 
     axis_limits = shared_trajectory_limits(*trajectories)

@@ -4,9 +4,15 @@ import os
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
-from scipy.signal import savgol_filter
 from pathlib import Path
+
+from .common import (
+    LossHistory,
+    SequenceData,
+    TrainedArtifact,
+    average_loss,
+    evaluate_tensor_loader,
+)
 
 
 # ==========================================
@@ -106,139 +112,79 @@ class OxIODSpeedDataset(Dataset):
         )
 
 
-# ==========================================
-# 3. 核心训练与全空间对齐还原
-# ==========================================
-def train_and_restore_v9():
-    root, cat = str(Path(__file__).resolve().parents[1] / "datasets"), "handheld"
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+def train_mlp_model(
+    dataset_root: Path | str,
+    category: str,
+    device: torch.device,
+    epochs: int,
+    batch_size: int,
+    num_workers: int,
+) -> TrainedArtifact:
+    train_set = OxIODSpeedDataset(str(dataset_root), category, mode="train")
+    val_set = OxIODSpeedDataset(str(dataset_root), category, mode="test", stats=train_set.stats)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
-    train_set = OxIODSpeedDataset(root, cat, mode="train")
-    loader = DataLoader(train_set, batch_size=64, shuffle=True)
     model = SpeedNet().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.HuberLoss()
+    train_history: list[float] = []
+    val_history: list[float] = []
 
-    print("--- 训练 PDR v9.0: 正在进行特征学习 ---")
-    for epoch in range(41):
+    for epoch in range(epochs):
         model.train()
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
+        losses: list[float] = []
+        for x, y in train_loader:
+            x = x.to(device)
+            y = y.to(device)
             optimizer.zero_grad()
-            loss = nn.HuberLoss()(model(x), y)
+            loss = criterion(model(x), y)
             loss.backward()
             optimizer.step()
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch:02d}")
+            losses.append(float(loss.item()))
 
-    # --- 全空间推理对齐 ---
-    model.eval()
-    base = os.path.join(root, cat, "data5", "syn")
-    imu_df = (
-        pd.read_csv(os.path.join(base, "imu1.csv"), header=None)
-        .iloc[::4, :]
-        .reset_index(drop=True)
-    )
-    gt_df = (
-        pd.read_csv(os.path.join(base, "vi1.csv"), header=None)
-        .iloc[::4, :]
-        .reset_index(drop=True)
-    )
+        train_loss = average_loss(losses)
+        val_loss = evaluate_tensor_loader(model, val_loader, criterion, device)
+        train_history.append(train_loss)
+        val_history.append(val_loss)
+        print(f"MLP   Epoch {epoch + 1:02d}/{epochs:02d} | train={train_loss:.6f} | val={val_loss:.6f}")
 
-    yaws = imu_df.iloc[:, 3].values
-    yaws_smooth = np.arctan2(
-        savgol_filter(np.sin(yaws), 51, 3), savgol_filter(np.cos(yaws), 51, 3)
-    )
-    acc_mag = np.linalg.norm(imu_df.iloc[:, 4:7].values, axis=1)
-    gt_p = gt_df.iloc[:, 2:4].values - gt_df.iloc[0, 2:4].values
+    return TrainedArtifact(model=model, stats=train_set.stats, history=LossHistory(train_history, val_history))
 
-    roll, pitch = imu_df.iloc[:, 1].values, imu_df.iloc[:, 2].values
-    feat_all = np.hstack(
-        [
-            imu_df.iloc[:, 4:10].values,
-            np.sin(roll[:, None]),
-            np.cos(roll[:, None]),
-            np.sin(pitch[:, None]),
-            np.cos(pitch[:, None]),
-            acc_mag[:, None],
-        ]
-    )
 
-    # 1. 预测速度
-    pred_speeds = []
+def evaluate_mlp_model(
+    artifact: TrainedArtifact,
+    sequence_data: SequenceData,
+    device: torch.device,
+) -> tuple[np.ndarray, float]:
+    artifact.model.eval()
+    pred_speeds: list[float] = []
     with torch.no_grad():
-        for i in range(0, len(feat_all) - 30, 10):
-            x = (
-                torch.tensor(
-                    (feat_all[i : i + 20] - train_set.stats["mean"])
-                    / train_set.stats["std"]
-                )
-                .float()
-                .unsqueeze(0)
-                .to(device)
-            )
-            speed = model(x).cpu().numpy()[0, 0] / 20.0
-            if np.std(acc_mag[i : i + 20]) < 0.06:
+        for index in range(0, len(sequence_data.feat_all) - 30, 10):
+            normalized = (sequence_data.feat_all[index : index + 20] - artifact.stats["mean"]) / artifact.stats["std"]
+            x_tensor = torch.from_numpy(normalized).float().unsqueeze(0).to(device)
+            speed = float(artifact.model(x_tensor).cpu().numpy()[0, 0] / 20.0)
+            if np.std(sequence_data.acc_mag[index : index + 20]) < 0.06:
                 speed = 0.0
             pred_speeds.append(speed)
 
-    # 2. 全空间旋转对齐 (0-360度)
-    print("--- 正在执行 360 度全空间形状拟合 ---")
     best_rmse = float("inf")
     best_traj = None
-    best_angle = 0
-
-    # 我们遍历整个圆周，寻找那个能让形状完全“重合”的角度
     for trial_bias in np.linspace(0, 2 * np.pi, 360):
-        curr_p = np.array([0.0, 0.0])
-        traj = [curr_p.copy()]
-        # 针对该数据的微小比例修正和漂移修正
+        current = np.array([0.0, 0.0])
+        trajectory = [current.copy()]
         scale_fix = 0.90
         drift_fix = -0.000015
-
-        for idx, s in enumerate(pred_speeds):
-            t_idx = idx * 10
-            theta = yaws_smooth[t_idx + 20] + trial_bias + (t_idx * drift_fix)
-            curr_p += [(s * scale_fix) * np.cos(theta), (s * scale_fix) * np.sin(theta)]
+        for step_index, speed in enumerate(pred_speeds):
+            t_index = step_index * 10
+            theta = sequence_data.yaws_smooth[t_index + 20] + trial_bias + (t_index * drift_fix)
+            current += [(speed * scale_fix) * np.cos(theta), (speed * scale_fix) * np.sin(theta)]
             for _ in range(10):
-                traj.append(curr_p.copy())
-
-        traj_arr = np.array(traj)
-        eval_len = min(len(traj_arr), len(gt_p))
-        rmse = np.sqrt(
-            np.mean(np.sum((traj_arr[:eval_len] - gt_p[:eval_len]) ** 2, axis=1))
-        )
-
+                trajectory.append(current.copy())
+        traj_array = np.array(trajectory)
+        eval_len = min(len(traj_array), len(sequence_data.gt_pos))
+        rmse = np.sqrt(np.mean(np.sum((traj_array[:eval_len] - sequence_data.gt_pos[:eval_len]) ** 2, axis=1)))
         if rmse < best_rmse:
             best_rmse = rmse
-            best_traj = traj_arr
-            best_angle = trial_bias
-
-    print(
-        f"\n[最终还原成功] 自动对齐角度: {np.degrees(best_angle):.2f}° | 最小 RMSE: {best_rmse:.2f}m"
-    )
-
-    plt.figure(figsize=(10, 10))
-    plt.plot(gt_p[:, 0], gt_p[:, 1], "g", label="Ground Truth", linewidth=3)
-    plt.plot(
-        best_traj[:, 0],
-        best_traj[:, 1],
-        "r--",
-        label="PDR v9.0 (Best-Fit Alignment)",
-        alpha=0.9,
-    )
-    plt.title(
-        f"Sequence: data5 | Final Restoration\nRMSE: {best_rmse:.2f}m (Auto-Aligned)"
-    )
-    plt.legend()
-    plt.axis("equal")
-    plt.grid(True)
-    plt.show()
-
-
-if __name__ == "__main__":
-    train_and_restore_v9()
+            best_traj = traj_array
+    return best_traj, best_rmse

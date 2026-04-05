@@ -4,10 +4,17 @@ import os
 import torch
 import torch.nn as nn
 from torch_geometric.nn import GATv2Conv, BatchNorm
-from torch_geometric.data import Data, DataLoader as PyGDataLoader
-import matplotlib.pyplot as plt
-from scipy.signal import savgol_filter
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader as PyGDataLoader
 from pathlib import Path
+
+from .common import (
+    LossHistory,
+    SequenceData,
+    TrainedArtifact,
+    average_loss,
+    evaluate_graph_loader,
+)
 
 # ==========================================
 # 1. GNN 模型：利用图注意力机制学习位移
@@ -129,6 +136,44 @@ class OxIODGNNDataset:
     def __len__(self): return len(self.data_list)
     def __getitem__(self, idx): return self.data_list[idx]
 
+
+def train_gnn_model(
+    dataset_root: Path | str,
+    category: str,
+    device: torch.device,
+    epochs: int,
+    batch_size: int,
+) -> TrainedArtifact:
+    train_set = OxIODGNNDataset(str(dataset_root), category, mode="train")
+    val_set = OxIODGNNDataset(str(dataset_root), category, mode="test", stats=train_set.stats)
+    train_loader = PyGDataLoader(train_set, batch_size=batch_size, shuffle=True)
+    val_loader = PyGDataLoader(val_set, batch_size=batch_size, shuffle=False)
+
+    model = Scalar_GNN(input_dim=11).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    criterion = nn.HuberLoss()
+    train_history: list[float] = []
+    val_history: list[float] = []
+
+    for epoch in range(epochs):
+        model.train()
+        losses: list[float] = []
+        for data in train_loader:
+            data = data.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(data), data.y)
+            loss.backward()
+            optimizer.step()
+            losses.append(float(loss.item()))
+
+        train_loss = average_loss(losses)
+        val_loss = evaluate_graph_loader(model, val_loader, criterion, device)
+        train_history.append(train_loss)
+        val_history.append(val_loss)
+        print(f"GNN   Epoch {epoch + 1:02d}/{epochs:02d} | train={train_loss:.6f} | val={val_loss:.6f}")
+
+    return TrainedArtifact(model=model, stats=train_set.stats, history=LossHistory(train_history, val_history))
+
 # ==========================================
 # 3. 核心算法：矢量化轨迹还原
 # ==========================================
@@ -140,79 +185,41 @@ def generate_trajectory_vectorized(speeds, yaws, bias, scale, drift):
     dy = (speeds * scale) * np.sin(thetas)
     return np.stack([np.cumsum(np.insert(dx, 0, 0)), np.cumsum(np.insert(dy, 0, 0))], axis=1)
 
-# ==========================================
-# 4. 训练与亚米级拟合
-# ==========================================
-def run_gnn_pdr():
-    root, cat = str(Path(__file__).resolve().parents[1] / "datasets"), "handheld"
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
 
-    train_set = OxIODGNNDataset(root, cat, mode='train')
-    loader = PyGDataLoader(train_set, batch_size=32, shuffle=True)
-    
-    model = Scalar_GNN(input_dim=11).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    
-    print("--- 训练 GNN 标量模型 ---")
-    for epoch in range(31): # GNN 收敛较快
-        model.train()
-        loss_epoch = 0
-        for data in loader:
-            data = data.to(device)
-            optimizer.zero_grad()
-            pred = model(data)
-            loss = nn.HuberLoss()(pred, data.y)
-            loss.backward(); optimizer.step()
-            loss_epoch += loss.item()
-        if epoch % 10 == 0: print(f"Epoch {epoch:02d} | Loss: {loss_epoch/len(loader):.6f}")
+def evaluate_gnn_model(
+    artifact: TrainedArtifact,
+    sequence_data: SequenceData,
+    device: torch.device,
+) -> tuple[np.ndarray, float]:
+    artifact.model.eval()
+    feat_norm = (sequence_data.feat_all - artifact.stats["mean"]) / artifact.stats["std"]
+    x_tensor = torch.tensor(feat_norm, dtype=torch.float32).to(device)
+    edge_start = torch.arange(0, len(feat_norm) - 1)
+    edge_end = torch.arange(1, len(feat_norm))
+    edge_index = torch.stack([torch.cat([edge_start, edge_end]), torch.cat([edge_end, edge_start])], dim=0).to(device)
 
-    # --- 推理推理 (以 data5 为例) ---
-    model.eval()
-    base = os.path.join(root, cat, "data5", "syn")
-    imu_df = pd.read_csv(os.path.join(base, 'imu1.csv'), header=None).iloc[::4, :].reset_index(drop=True)
-    gt_df = pd.read_csv(os.path.join(base, 'vi1.csv'), header=None).iloc[::4, :].reset_index(drop=True)
-    
-    yaws = imu_df.iloc[:, 3].values
-    yaws_smooth = np.arctan2(savgol_filter(np.sin(yaws), 51, 3), savgol_filter(np.cos(yaws), 51, 3))
-    gt_p = gt_df.iloc[:, 2:4].values - gt_df.iloc[0, 2:4].values
-    
-    # 准备推理数据
-    roll, pitch = imu_df.iloc[:, 1].values, imu_df.iloc[:, 2].values
-    acc_mag = np.linalg.norm(imu_df.iloc[:, 4:7].values, axis=1)
-    feat_all = np.hstack([imu_df.iloc[:, 4:7].values, imu_df.iloc[:, 7:10].values, 
-                          np.sin(roll[:,None]), np.cos(roll[:,None]), np.sin(pitch[:,None]), np.cos(pitch[:,None]), acc_mag[:,None]])
-    feat_norm = (feat_all - train_set.stats['mean']) / train_set.stats['std']
-    
-    # 构建全长图进行一次性预测
-    x_t = torch.tensor(feat_norm, dtype=torch.float32).to(device)
-    e_s = torch.arange(0, len(feat_norm)-1); e_e = torch.arange(1, len(feat_norm))
-    edge_index = torch.stack([torch.cat([e_s, e_e]), torch.cat([e_e, e_s])], dim=0).to(device)
-    test_data = Data(x=x_t, edge_index=edge_index).to(device)
-
+    test_data = Data(x=x_tensor, edge_index=edge_index).to(device)
     with torch.no_grad():
-        pred_speeds = model(test_data).cpu().numpy().flatten() / 100.0
-        # ZUPT 静止清理
-        for t in range(len(pred_speeds)):
-            if np.std(acc_mag[max(0, t-10):min(len(acc_mag), t+10)]) < 0.05: pred_speeds[t] = 0.0
+        pred_speeds = artifact.model(test_data).cpu().numpy().flatten() / 100.0
+    for index in range(len(pred_speeds)):
+        start = max(0, index - 10)
+        end = min(len(sequence_data.acc_mag), index + 10)
+        if np.std(sequence_data.acc_mag[start:end]) < 0.05:
+            pred_speeds[index] = 0.0
 
-    print("--- 执行粗-精双重搜索 ---")
-    best_rmse = float('inf'); best_traj = None
-    sampled_yaws = yaws_smooth
-    
-    # 简化搜索流程 (演示用)
-    for bias in np.linspace(0, 2*np.pi, 60):
-        traj = generate_trajectory_vectorized(pred_speeds, sampled_yaws, bias, 1.0, 0.0)
-        e_len = min(len(traj), len(gt_p))
-        rmse = np.sqrt(np.mean(np.sum((traj[:e_len] - gt_p[:e_len])**2, axis=1)))
+    best_rmse = float("inf")
+    best_traj = None
+    for bias in np.linspace(0, 2 * np.pi, 60):
+        traj = np.stack(
+            [
+                np.cumsum(np.insert((pred_speeds * np.cos(sequence_data.yaws_smooth[: len(pred_speeds)] + bias)), 0, 0.0)),
+                np.cumsum(np.insert((pred_speeds * np.sin(sequence_data.yaws_smooth[: len(pred_speeds)] + bias)), 0, 0.0)),
+            ],
+            axis=1,
+        )
+        eval_len = min(len(traj), len(sequence_data.gt_pos))
+        rmse = np.sqrt(np.mean(np.sum((traj[:eval_len] - sequence_data.gt_pos[:eval_len]) ** 2, axis=1)))
         if rmse < best_rmse:
-            best_rmse = rmse; best_traj = traj
-
-    print(f"\n[GNN 结果] 最小 RMSE: {best_rmse:.2f}m")
-    plt.figure(figsize=(8,8))
-    plt.plot(gt_p[:,0], gt_p[:,1], 'g', label='Ground Truth')
-    plt.plot(best_traj[:,0], best_traj[:,1], 'r--', label='GNN + GridFit')
-    plt.legend(); plt.axis('equal'); plt.title(f"GNN PDR RMSE: {best_rmse:.2f}m"); plt.show()
-
-if __name__ == "__main__":
-    run_gnn_pdr()
+            best_rmse = rmse
+            best_traj = traj
+    return best_traj, best_rmse

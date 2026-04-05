@@ -4,10 +4,15 @@ import os
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
-from scipy.signal import savgol_filter
-import time
 from pathlib import Path
+
+from .common import (
+    LossHistory,
+    SequenceData,
+    TrainedArtifact,
+    average_loss,
+    evaluate_tensor_loader,
+)
 
 # ==========================================
 # 1. 稳健的标量速度模型 (回归 v9.0 架构)
@@ -79,6 +84,45 @@ class OxIODSpeedDataset(Dataset):
         x = (self.features[idx] - self.stats['mean']) / self.stats['std']
         return torch.tensor(x, dtype=torch.float32), torch.tensor(self.targets[idx] * 20.0, dtype=torch.float32)
 
+
+def train_arcnn_model(
+    dataset_root: Path | str,
+    category: str,
+    device: torch.device,
+    epochs: int,
+    batch_size: int,
+    num_workers: int,
+) -> TrainedArtifact:
+    train_set = OxIODSpeedDataset(str(dataset_root), category, mode="train")
+    val_set = OxIODSpeedDataset(str(dataset_root), category, mode="test", stats=train_set.stats)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    model = SpeedNet().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.HuberLoss()
+    train_history: list[float] = []
+    val_history: list[float] = []
+
+    for epoch in range(epochs):
+        model.train()
+        losses: list[float] = []
+        for x, y in train_loader:
+            x = x.to(device)
+            y = y.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(x), y)
+            loss.backward()
+            optimizer.step()
+            losses.append(float(loss.item()))
+        train_loss = average_loss(losses)
+        val_loss = evaluate_tensor_loader(model, val_loader, criterion, device)
+        train_history.append(train_loss)
+        val_history.append(val_loss)
+        print(f"ARCNN Epoch {epoch + 1:02d}/{epochs:02d} | train={train_loss:.6f} | val={val_loss:.6f}")
+
+    return TrainedArtifact(model=model, stats=train_set.stats, history=LossHistory(train_history, val_history))
+
 # ==========================================
 # 3. 快速矢量化轨迹生成器
 # ==========================================
@@ -107,98 +151,46 @@ def generate_trajectory_vectorized(speeds, yaws, bias, scale, drift):
     
     return traj_full
 
-# ==========================================
-# 4. 训练与亚米级对齐
-# ==========================================
-def train_and_break_1m():
-    root, cat = str(Path(__file__).resolve().parents[1] / "datasets"), "handheld"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    train_set = OxIODSpeedDataset(root, cat, mode='train')
-    loader = DataLoader(train_set, batch_size=64, shuffle=True)
-    model = SpeedNet().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-    print("--- 训练 PDR v12.0: 标量回归 ---")
-    for epoch in range(41):
-        model.train()
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            optimizer.zero_grad()
-            loss = nn.HuberLoss()(model(x), y)
-            loss.backward(); optimizer.step()
-        if epoch % 10 == 0: print(f"Epoch {epoch:02d} completed.")
-
-    # --- 获取 data5 数据 ---
-    model.eval()
-    base = os.path.join(root, cat, "data5", "syn")
-    imu_df = pd.read_csv(os.path.join(base, 'imu1.csv'), header=None).iloc[::4, :].reset_index(drop=True)
-    gt_df = pd.read_csv(os.path.join(base, 'vi1.csv'), header=None).iloc[::4, :].reset_index(drop=True)
-    
-    yaws = imu_df.iloc[:, 3].values
-    yaws_smooth = np.arctan2(savgol_filter(np.sin(yaws), 51, 3), savgol_filter(np.cos(yaws), 51, 3))
-    acc_mag = np.linalg.norm(imu_df.iloc[:, 4:7].values, axis=1)
-    gt_p = gt_df.iloc[:, 2:4].values - gt_df.iloc[0, 2:4].values
-    
-    roll, pitch = imu_df.iloc[:, 1].values, imu_df.iloc[:, 2].values
-    feat_all = np.hstack([imu_df.iloc[:, 4:10].values, np.sin(roll[:,None]), np.cos(roll[:,None]), 
-                          np.sin(pitch[:,None]), np.cos(pitch[:,None]), acc_mag[:,None]])
-
-    pred_speeds = []
-    sampled_yaws = []
+def evaluate_arcnn_model(
+    artifact: TrainedArtifact,
+    sequence_data: SequenceData,
+    device: torch.device,
+) -> tuple[np.ndarray, float]:
+    artifact.model.eval()
+    pred_speeds: list[float] = []
+    sampled_yaws: list[float] = []
     with torch.no_grad():
-        for i in range(0, len(feat_all) - 30, 10):
-            x = torch.tensor((feat_all[i:i+20] - train_set.stats['mean'])/train_set.stats['std']).float().unsqueeze(0).to(device)
-            speed = model(x).cpu().numpy()[0, 0] / 20.0
-            if np.std(acc_mag[i:i+20]) < 0.05: speed = 0.0
+        for index in range(0, len(sequence_data.feat_all) - 30, 10):
+            normalized = (sequence_data.feat_all[index : index + 20] - artifact.stats["mean"]) / artifact.stats["std"]
+            x_tensor = torch.from_numpy(normalized).float().unsqueeze(0).to(device)
+            speed = float(artifact.model(x_tensor).cpu().numpy()[0, 0] / 20.0)
+            if np.std(sequence_data.acc_mag[index : index + 20]) < 0.05:
+                speed = 0.0
             pred_speeds.append(speed)
-            sampled_yaws.append(yaws_smooth[i+20])
-            
-    pred_speeds = np.array(pred_speeds)
-    sampled_yaws = np.array(sampled_yaws)
+            sampled_yaws.append(sequence_data.yaws_smooth[index + 20])
 
-    print("--- 正在执行 粗-精双重网格搜索 (冲击 1.0m) ---")
-    start_time = time.time()
-    
-    # 1. 粗搜索：找大方向
-    best_coarse_bias = 0
-    best_rmse = float('inf')
-    for bias in np.linspace(0, 2*np.pi, 360):
-        traj = generate_trajectory_vectorized(pred_speeds, sampled_yaws, bias, 1.0, 0.0)
-        eval_len = min(len(traj), len(gt_p))
-        rmse = np.sqrt(np.mean(np.sum((traj[:eval_len] - gt_p[:eval_len])**2, axis=1)))
+    pred_speeds_arr = np.array(pred_speeds)
+    sampled_yaws_arr = np.array(sampled_yaws)
+    best_coarse_bias = 0.0
+    best_rmse = float("inf")
+
+    for bias in np.linspace(0, 2 * np.pi, 360):
+        traj = generate_trajectory_vectorized(pred_speeds_arr, sampled_yaws_arr, bias, 1.0, 0.0)
+        eval_len = min(len(traj), len(sequence_data.gt_pos))
+        rmse = np.sqrt(np.mean(np.sum((traj[:eval_len] - sequence_data.gt_pos[:eval_len]) ** 2, axis=1)))
         if rmse < best_rmse:
             best_rmse = rmse
             best_coarse_bias = bias
 
-    # 2. 精搜索：在 ±10度内，极高精度联动搜索
-    fine_biases = np.linspace(best_coarse_bias - np.radians(10), best_coarse_bias + np.radians(10), 100)
-    fine_scales = np.linspace(0.85, 1.05, 21) # 21 个尺度
-    fine_drifts = np.linspace(-3e-5, 3e-5, 11) # 11 个漂移参数
-    
-    best_params = None
     best_traj = None
-    
-    for bias in fine_biases:
-        for scale in fine_scales:
-            for drift in fine_drifts:
-                traj = generate_trajectory_vectorized(pred_speeds, sampled_yaws, bias, scale, drift)
-                eval_len = min(len(traj), len(gt_p))
-                rmse = np.sqrt(np.mean(np.sum((traj[:eval_len] - gt_p[:eval_len])**2, axis=1)))
+    for bias in np.linspace(best_coarse_bias - np.radians(10), best_coarse_bias + np.radians(10), 100):
+        for scale in np.linspace(0.85, 1.05, 21):
+            for drift in np.linspace(-3e-5, 3e-5, 11):
+                traj = generate_trajectory_vectorized(pred_speeds_arr, sampled_yaws_arr, bias, scale, drift)
+                eval_len = min(len(traj), len(sequence_data.gt_pos))
+                rmse = np.sqrt(np.mean(np.sum((traj[:eval_len] - sequence_data.gt_pos[:eval_len]) ** 2, axis=1)))
                 if rmse < best_rmse:
                     best_rmse = rmse
                     best_traj = traj
-                    best_params = (np.degrees(bias), scale, drift)
-
-    print(f"优化耗时: {time.time() - start_time:.2f}秒")
-    print(f"\n[亚米级还原成功!] 最小 RMSE: {best_rmse:.2f}m")
-    print(f"最优参数 -> 偏置: {best_params[0]:.2f}°, 尺度: {best_params[1]:.2f}, 漂移: {best_params[2]:.2e}")
-
-    plt.figure(figsize=(10, 10))
-    plt.plot(gt_p[:, 0], gt_p[:, 1], 'g', label='Ground Truth', linewidth=3)
-    plt.plot(best_traj[:, 0], best_traj[:, 1], 'r--', label='PDR v12 (Scalar + Fine Grid)', alpha=0.9)
-    plt.title(f"Sequence: data5 | Sub-Meter Restoration\nRMSE: {best_rmse:.2f}m")
-    plt.legend(); plt.axis('equal'); plt.grid(True); plt.show()
-
-if __name__ == "__main__":
-    train_and_break_1m()
+    return best_traj, best_rmse

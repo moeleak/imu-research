@@ -17,6 +17,27 @@
   caption: cap,
 )
 
+#let stacked-result-row(left-path, left-cap, right-path, right-cap, height: 9.2cm) = {
+  v(0.1em)
+  grid(
+    columns: (1fr, 1fr),
+    gutter: 0.35em,
+    row-gutter: 0.1em,
+    align(center)[
+      #text(size: 0.66em)[#left-cap]
+    ],
+    align(center)[
+      #text(size: 0.66em)[#right-cap]
+    ],
+    align(center)[
+      #image(left-path, height: height)
+    ],
+    align(center)[
+      #image(right-path, height: height)
+    ],
+  )
+}
+
 #title-slide()
 
 == Outline <touying:hidden>
@@ -188,40 +209,40 @@
 
 == Baseline and Compact Regressor
 
-#slide(composer: (1fr, 1fr))[
-  #result-figure(
-    "assets/standalone/baseline.png",
-    [Baseline]
-  )
-][
-  #result-figure(
-    "assets/standalone/mlp.png",
-    [CNN-MLP]
-  )
+#[
+  #set text(size: 0.82em)
+  #set par(leading: 0.92em)
+  - The baseline captures coarse turns but is sensitive to pace and pose changes.
+  - CNN-MLP learns local displacement and adapts better to inertial patterns.
+  - Limited long-range context still leaves drift after long integration.
 ]
 
-- The baseline captures coarse turns but is sensitive to pace and pose changes.
-- CNN-MLP learns local displacement and adapts better to inertial patterns.
-- Limited long-range context still leaves drift after long integration.
+#stacked-result-row(
+  "assets/standalone/baseline.png",
+  [Baseline],
+  "assets/standalone/mlp.png",
+  [CNN-MLP],
+  height: 9.2cm,
+)
 
 
 == Stride-Aware and Sequential Models
 
-#slide(composer: (1fr, 1fr))[
-  #result-figure(
-    "assets/standalone/mlp_autoregressive.png",
-    [AR-CNN]
-  )
-][
-  #result-figure(
-    "assets/standalone/lstm.png",
-    [LSTM]
-  )
+#[
+  #set text(size: 0.82em)
+  #set par(leading: 0.92em)
+  - AR-CNN gives smoother step-to-step predictions.
+  - LSTM strengthens longer-range temporal continuity.
+  - Both handle speed and turning changes better than fixed-step logic.
 ]
 
-- AR-CNN gives smoother step-to-step predictions.
-- LSTM strengthens longer-range temporal continuity.
-- Both handle speed and turning changes better than fixed-step logic.
+#stacked-result-row(
+  "assets/standalone/mlp_autoregressive.png",
+  [AR-CNN],
+  "assets/standalone/lstm.png",
+  [LSTM],
+  height: 9.2cm,
+)
 
 
 == Graph-Based Motion Modeling

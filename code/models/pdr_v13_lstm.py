@@ -4,10 +4,15 @@ import os
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-import matplotlib.pyplot as plt
-from scipy.signal import savgol_filter
-import time
 from pathlib import Path
+
+from .common import (
+    LossHistory,
+    SequenceData,
+    TrainedArtifact,
+    average_loss,
+    evaluate_tensor_loader,
+)
 
 # ==========================================
 # 1. 标量输出的 LSTM 模型
@@ -81,6 +86,46 @@ class OxIODLSTMScalarDataset(Dataset):
         # 放大 100 倍，因为单帧位移极小
         return torch.tensor(x, dtype=torch.float32), torch.tensor(self.targets[idx], dtype=torch.float32) * 100.0
 
+
+def train_lstm_model(
+    dataset_root: Path | str,
+    category: str,
+    device: torch.device,
+    epochs: int,
+    batch_size: int,
+    num_workers: int,
+) -> TrainedArtifact:
+    train_set = OxIODLSTMScalarDataset(str(dataset_root), category, mode="train", seq_len=100)
+    val_set = OxIODLSTMScalarDataset(str(dataset_root), category, mode="test", seq_len=100, stats=train_set.stats)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+    model = Scalar_LSTM().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    criterion = nn.HuberLoss()
+    train_history: list[float] = []
+    val_history: list[float] = []
+
+    for epoch in range(epochs):
+        model.train()
+        losses: list[float] = []
+        for x, y in train_loader:
+            x = x.to(device)
+            y = y.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(x), y)
+            loss.backward()
+            optimizer.step()
+            losses.append(float(loss.item()))
+
+        train_loss = average_loss(losses)
+        val_loss = evaluate_tensor_loader(model, val_loader, criterion, device)
+        train_history.append(train_loss)
+        val_history.append(val_loss)
+        print(f"LSTM  Epoch {epoch + 1:02d}/{epochs:02d} | train={train_loss:.6f} | val={val_loss:.6f}")
+
+    return TrainedArtifact(model=model, stats=train_set.stats, history=LossHistory(train_history, val_history))
+
 # ==========================================
 # 3. 矢量化轨迹生成 (用于极速搜索)
 # ==========================================
@@ -96,94 +141,57 @@ def generate_trajectory_vectorized(speeds, yaws, bias, scale, drift):
     traj_y = np.cumsum(np.insert(dy, 0, 0))
     return np.stack([traj_x, traj_y], axis=1)
 
-# ==========================================
-# 4. 训练与亚米级拟合
-# ==========================================
-def train_and_eval_lstm_scalar():
-    root, cat = str(Path(__file__).resolve().parents[1] / "datasets"), "handheld"
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    train_set = OxIODLSTMScalarDataset(root, cat, mode='train', seq_len=100)
-    loader = DataLoader(train_set, batch_size=32, shuffle=True)
-    model = Scalar_LSTM().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    
-    print("--- 训练 PDR v14.0: LSTM 标量回归 ---")
-    for epoch in range(61):
-        model.train()
-        loss_epoch = 0
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            optimizer.zero_grad()
-            pred = model(x)
-            loss = nn.HuberLoss()(pred, y)
-            loss.backward(); optimizer.step()
-            loss_epoch += loss.item()
-        if epoch % 10 == 0: print(f"Epoch {epoch:02d} | Loss: {loss_epoch/len(loader):.6f}")
 
-    # --- 推理 ---
-    model.eval()
-    base = os.path.join(root, cat, "data5", "syn")
-    imu_df = pd.read_csv(os.path.join(base, 'imu1.csv'), header=None).iloc[::4, :].reset_index(drop=True)
-    gt_df = pd.read_csv(os.path.join(base, 'vi1.csv'), header=None).iloc[::4, :].reset_index(drop=True)
-    
-    yaws = imu_df.iloc[:, 3].values
-    yaws_smooth = np.arctan2(savgol_filter(np.sin(yaws), 51, 3), savgol_filter(np.cos(yaws), 51, 3))
-    gt_p = gt_df.iloc[:, 2:4].values - gt_df.iloc[0, 2:4].values
-    
-    roll, pitch = imu_df.iloc[:, 1].values, imu_df.iloc[:, 2].values
-    acc_mag = np.linalg.norm(imu_df.iloc[:, 4:7].values, axis=1)
-    feat_all = np.hstack([imu_df.iloc[:, 4:7].values, imu_df.iloc[:, 7:10].values, 
-                          np.sin(roll[:,None]), np.cos(roll[:,None]), np.sin(pitch[:,None]), np.cos(pitch[:,None]), acc_mag[:,None]])
+def align_lstm_trajectory(
+    speeds: np.ndarray,
+    yaws: np.ndarray,
+    gt_pos: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    def generate_traj(bias: float, scale: float, drift: float) -> np.ndarray:
+        t_indices = np.arange(len(speeds))
+        thetas = yaws[: len(speeds)] + bias + (t_indices * drift)
+        dx = (speeds * scale) * np.cos(thetas)
+        dy = (speeds * scale) * np.sin(thetas)
+        traj_x = np.cumsum(np.insert(dx, 0, 0.0))
+        traj_y = np.cumsum(np.insert(dy, 0, 0.0))
+        return np.stack([traj_x, traj_y], axis=1)
 
-    x_test = (feat_all - train_set.stats['mean']) / train_set.stats['std']
-    x_test = x_test[:-1] # 对齐截断
-    x_tensor = torch.tensor(x_test).float().unsqueeze(0).to(device)
+    best_coarse_bias = 0.0
+    best_rmse = float("inf")
+    for bias in np.linspace(0, 2 * np.pi, 120):
+        traj = generate_traj(bias, 1.0, 0.0)
+        eval_len = min(len(traj), len(gt_pos))
+        rmse = np.sqrt(np.mean(np.sum((traj[:eval_len] - gt_pos[:eval_len]) ** 2, axis=1)))
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best_coarse_bias = bias
 
-    with torch.no_grad():
-        pred_seq = model(x_tensor)
-        pred_speeds = pred_seq.cpu().numpy()[0, :, 0] / 100.0 # 还原 100 倍
-        
-        # ZUPT: 对 LSTM 逐帧输出进行物理静止清理
-        for t in range(len(pred_speeds)):
-            start = max(0, t-10); end = min(len(acc_mag), t+10)
-            if np.std(acc_mag[start:end]) < 0.05: pred_speeds[t] = 0.0
-
-    print("--- 执行 粗-精双重对齐搜索 ---")
-    sampled_yaws = yaws_smooth[:-1]
-    
-    # 1. 粗搜索
-    best_coarse_bias = 0
-    best_rmse = float('inf')
-    for bias in np.linspace(0, 2*np.pi, 120):
-        traj = generate_trajectory_vectorized(pred_speeds, sampled_yaws, bias, 1.0, 0.0)
-        eval_len = min(len(traj), len(gt_p))
-        rmse = np.sqrt(np.mean(np.sum((traj[:eval_len] - gt_p[:eval_len])**2, axis=1)))
-        if rmse < best_rmse: best_rmse = rmse; best_coarse_bias = bias
-
-    # 2. 精细搜索
-    fine_biases = np.linspace(best_coarse_bias - np.radians(10), best_coarse_bias + np.radians(10), 100)
-    fine_scales = np.linspace(0.85, 1.05, 21)
-    fine_drifts = np.linspace(-3e-5, 3e-5, 11)
-    
     best_traj = None
-    for bias in fine_biases:
-        for scale in fine_scales:
-            for drift in fine_drifts:
-                traj = generate_trajectory_vectorized(pred_speeds, sampled_yaws, bias, scale, drift)
-                eval_len = min(len(traj), len(gt_p))
-                rmse = np.sqrt(np.mean(np.sum((traj[:eval_len] - gt_p[:eval_len])**2, axis=1)))
+    for bias in np.linspace(best_coarse_bias - np.radians(10), best_coarse_bias + np.radians(10), 100):
+        for scale in np.linspace(0.85, 1.05, 21):
+            for drift in np.linspace(-3e-5, 3e-5, 11):
+                traj = generate_traj(bias, scale, drift)
+                eval_len = min(len(traj), len(gt_pos))
+                rmse = np.sqrt(np.mean(np.sum((traj[:eval_len] - gt_pos[:eval_len]) ** 2, axis=1)))
                 if rmse < best_rmse:
                     best_rmse = rmse
                     best_traj = traj
+    return best_traj, best_rmse
 
-    print(f"\n[LSTM 终极还原] 最小 RMSE: {best_rmse:.2f}m")
-    
-    plt.figure(figsize=(10,10))
-    plt.plot(gt_p[:,0], gt_p[:,1], 'g', label='Ground Truth', linewidth=3)
-    plt.plot(best_traj[:,0], best_traj[:,1], 'r--', label='PDR v14 (LSTM Scalar + GridFit)', alpha=0.9)
-    plt.title(f"Sequence: data5 | Sub-Meter LSTM\nRMSE: {best_rmse:.2f}m")
-    plt.legend(); plt.axis('equal'); plt.grid(True); plt.show()
 
-if __name__ == "__main__":
-    train_and_eval_lstm_scalar()
+def evaluate_lstm_model(
+    artifact: TrainedArtifact,
+    sequence_data: SequenceData,
+    device: torch.device,
+) -> tuple[np.ndarray, float]:
+    artifact.model.eval()
+    normalized = (sequence_data.feat_all - artifact.stats["mean"]) / artifact.stats["std"]
+    x_tensor = torch.from_numpy(normalized[:-1]).float().unsqueeze(0).to(device)
+    with torch.no_grad():
+        pred_seq = artifact.model(x_tensor).cpu().numpy()[0, :, 0] / 100.0
+    for index in range(len(pred_seq)):
+        start = max(0, index - 10)
+        end = min(len(sequence_data.acc_mag), index + 10)
+        if np.std(sequence_data.acc_mag[start:end]) < 0.05:
+            pred_seq[index] = 0.0
+    return align_lstm_trajectory(pred_seq, sequence_data.yaws_smooth, sequence_data.gt_pos)
