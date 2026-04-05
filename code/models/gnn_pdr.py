@@ -7,6 +7,7 @@ from torch_geometric.nn import GATv2Conv, BatchNorm
 from torch_geometric.data import Data, DataLoader as PyGDataLoader
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
+from pathlib import Path
 
 # ==========================================
 # 1. GNN 模型：利用图注意力机制学习位移
@@ -143,7 +144,7 @@ def generate_trajectory_vectorized(speeds, yaws, bias, scale, drift):
 # 4. 训练与亚米级拟合
 # ==========================================
 def run_gnn_pdr():
-    root, cat = "./Dataset", "handheld"
+    root, cat = str(Path(__file__).resolve().parents[1] / "datasets"), "handheld"
     device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -215,4 +216,3 @@ def run_gnn_pdr():
 
 if __name__ == "__main__":
     run_gnn_pdr()
-

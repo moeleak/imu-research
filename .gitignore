@@ -1,2 +1,6 @@
 *.pdf
 result
+__pycache__
+code/__pycache__
+code/datasets
+code/checkpoints

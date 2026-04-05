@@ -7,6 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
 import time
+from pathlib import Path
 
 # ==========================================
 # 1. 标量输出的 LSTM 模型
@@ -99,7 +100,7 @@ def generate_trajectory_vectorized(speeds, yaws, bias, scale, drift):
 # 4. 训练与亚米级拟合
 # ==========================================
 def train_and_eval_lstm_scalar():
-    root, cat = "./Dataset", "handheld"
+    root, cat = str(Path(__file__).resolve().parents[1] / "datasets"), "handheld"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     train_set = OxIODLSTMScalarDataset(root, cat, mode='train', seq_len=100)

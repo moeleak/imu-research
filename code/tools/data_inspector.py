@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation as R
 import os
+from pathlib import Path
 
 def inspect_oxiod_data(root_dir, category, data_folder):
     # 1. 路径设置
@@ -19,7 +20,7 @@ def inspect_oxiod_data(root_dir, category, data_folder):
     min_len = min(len(df_imu), len(df_gt))
     dt = 0.04
 
-    # 3. 模拟 dataset_cls.py 的处理逻辑
+    # 3. 模拟旧版数据集预处理逻辑
     acc = df_imu[['acc_x', 'acc_y', 'acc_z']].values[:min_len]
     acc_mag = np.linalg.norm(acc, axis=1) # 合加速度
     yaws = df_imu['yaw'].values[:min_len]
@@ -88,5 +89,4 @@ def inspect_oxiod_data(root_dir, category, data_folder):
     print(f"还原误差 (MSE): {np.mean((pos_xy_w - rev_pos_w)**2):.10f}")
 
 if __name__ == "__main__":
-    # 请根据实际路径修改
-    inspect_oxiod_data("./Dataset", "handheld", "data1")
+    inspect_oxiod_data(str(Path(__file__).resolve().parents[1] / "datasets"), "handheld", "data1")

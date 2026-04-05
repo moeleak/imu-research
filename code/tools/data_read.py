@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+from pathlib import Path
 
 def inspect_imu_physics(root_dir, category, sequence="data1"):
     """
@@ -62,5 +63,5 @@ def inspect_imu_physics(root_dir, category, sequence="data1"):
     plt.tight_layout()
     plt.show()
 
-# 运行检查
-inspect_imu_physics("./Dataset", "handheld", "data1")
+if __name__ == "__main__":
+    inspect_imu_physics(str(Path(__file__).resolve().parents[1] / "datasets"), "handheld", "data1")

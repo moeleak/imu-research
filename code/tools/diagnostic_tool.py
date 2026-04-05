@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
+from pathlib import Path
 
 def diagnose_data(root, cat, seq):
     # 1. 加载数据
@@ -65,5 +66,5 @@ def diagnose_data(root, cat, seq):
     plt.tight_layout()
     plt.show()
 
-# 执行诊断
-diagnose_data("./Dataset", "handheld", "data5")
+if __name__ == "__main__":
+    diagnose_data(str(Path(__file__).resolve().parents[1] / "datasets"), "handheld", "data5")

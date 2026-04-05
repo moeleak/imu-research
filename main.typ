@@ -13,7 +13,7 @@
 )
 
 #let result-figure(path, cap) = figure(
-  image(path, width: 100%),
+  image(path),
   caption: cap,
 )
 
@@ -27,29 +27,28 @@
 
 == Problem Statement
 
-- Inertial Measurement Unit (IMU) based Pedestrian Dead Reckoning (PDR) is attractive because it is infrastructure-free and can run on commodity mobile devices.
-- The main difficulty is that heading noise, uncertain step length, and cumulative integration drift quickly distort long trajectories.
-- A fixed-step baseline is easy to deploy, but it cannot adapt to different walking speeds, phone poses, or motion transitions.
-- The goal of this project is to compare multiple learning-based models under a unified IMU pipeline and inject stride-aware logic into the displacement prediction task.
-- The central question is whether gait-scale structure helps the model learn more realistic human motion patterns from inertial signals.
+- IMU-based PDR is infrastructure-free and phone-ready.
+- Main errors come from heading noise, step uncertainty, and drift.
+- Fixed-step methods break under speed, pose, and motion changes.
+- We compare learned models and test whether stride-aware design improves realism.
 
 
 == Contributions
 
-- A unified IMU preprocessing and reconstruction pipeline is used for all methods.
-- The prediction target is redesigned as scalar displacement with stride-aware temporal logic.
-- Classical, convolutional, recurrent, and graph-based models are compared under the same evaluation setting.
+- One IMU preprocessing and reconstruction pipeline for all methods.
+- Scalar displacement target with stride-aware temporal logic.
+- Comparison across classical, CNN, recurrent, and graph models.
 
 
 = Methodology
 
 == End-to-End Pipeline
 
-- Step 1: load the handheld sequences from the Oxford Inertial Odometry Dataset (OxIOD) and downsample the raw streams by a factor of four.
-- Step 2: construct an 11-dimensional feature vector from linear acceleration, angular velocity, roll and pitch trigonometric encoding, and acceleration magnitude.
-- Step 3: train each model to regress scalar displacement instead of absolute position.
-- Step 4: smooth the yaw angle with Savitzky-Golay filtering and remove static intervals with Zero-Velocity Update.
-- Step 5: reconstruct the trajectory by integrating predicted displacement with heading and perform bias, scale, and drift alignment for fair comparison.
+- Load OxIOD handheld sequences and downsample by `4x`.
+- Build 11-D features from acceleration, gyro, attitude, and norm.
+- Train each model to predict scalar displacement.
+- Smooth yaw and suppress static intervals with ZUPT.
+- Reconstruct trajectories with aligned bias, scale, and drift.
 
 #align(center)[
   $
@@ -58,7 +57,7 @@
 ]
 
 #text(size: 0.9em)[
-  where $a_t$ denotes linear acceleration, $omega_t$ denotes angular velocity, $r_t$ and $p_t$ denote roll and pitch, and $||a_t||_2$ denotes acceleration magnitude.
+  $a_t$: linear acceleration, $omega_t$: angular velocity, $r_t/p_t$: roll and pitch.
 ]
 
 
@@ -73,7 +72,7 @@
   ]
   
   #text(size: 0.85em)[
-    where $d_t$ is the displacement target, $p_t$ is the ground-truth position, $psi_t$ is the smoothed yaw, and $b$ and $delta$ denote heading bias and drift.
+    $d_t$: target displacement, $p_t$: ground truth position, $psi_t$: smoothed yaw.
   ]
 ][
   #align(center)[
@@ -85,7 +84,7 @@
   ]
   
   #text(size: 0.85em)[
-    where $hat(d)_t$ is the predicted displacement, $Delta x_t$ and $Delta y_t$ are trajectory increments, and $hat(p)_t$ is the reconstructed position.
+    $hat(d)_t$: predicted displacement, $Delta x_t / Delta y_t$: increments, $hat(p)_t$: path.
   ]
 ]
 
@@ -93,13 +92,13 @@
 == Dataset and Target Design
 
 #slide(composer: (1fr, 1fr))[
-  - Dataset: Oxford Inertial Odometry Dataset (OxIOD).
-  - Focus: handheld sequences and qualitative analysis on `data5`.
-  - Statistics are estimated on the training split and reused in testing.
+  - Dataset: OxIOD handheld sequences.
+  - Case study: `data5`.
+  - Train-set statistics are reused at test time.
 ][
-  - Window models use 20-frame inputs.
-  - Sequence models use 100-frame segments.
-  - The target is future scalar displacement, not coordinates.
+  - Window models: 20 frames.
+  - Sequence models: 100 frames.
+  - Target: future scalar displacement.
 ]
 
 
@@ -112,7 +111,6 @@
 ][
   - LSTM: frame-wise sequential displacement prediction.
   - GNN: Graph Attention Network v2 with temporal edges.
-  - Transformer: explored as an auxiliary extension.
 ]
 
 
@@ -125,13 +123,12 @@
 ]
 
 #text(size: 0.9em)[
-  where $y_t$ denotes the supervision label, and the label is defined as scalar displacement $d_t$ instead of Cartesian coordinates.
+  $y_t$ is the scalar displacement label.
 ]
 
-- Scalar displacement is used as the supervision target.
-- Temporal links inject stride-scale continuity into prediction.
-- The inductive bias is motion-aware rather than coordinate-aware.
-
+- Supervision target: scalar displacement.
+- Temporal links enforce stride continuity.
+- The inductive bias is motion-aware, not coordinate-aware.
 
 == Optimization Objective
 
@@ -144,7 +141,7 @@
   ]
   
   #text(size: 0.85em)[
-    where $v_t$ is a local motion-variance measure, $tau$ is the static threshold, $z_t$ is the static indicator, and $tilde(d)_t$ is the ZUPT-filtered prediction.
+    $v_t$: local motion variance, $tau$: static threshold, $z_t$: static flag.
   ]
 ][
   #align(center)[
@@ -155,7 +152,7 @@
   ]
   
   #text(size: 0.85em)[
-    where $rho$ denotes the robust regression penalty, $L$ is the basic training loss, and $L_s$ is the loss after static suppression.
+    $rho$: robust penalty, $L$: base loss, $L_s$: loss after static suppression.
   ]
 ]
 
@@ -164,11 +161,10 @@
 
 == Evaluation Protocol
 
-- All methods are trained on the same feature family and evaluated with the same heading reconstruction procedure.
-- Yaw is smoothed before integration to reduce phase noise from the raw inertial orientation signal.
-- Predicted displacement is converted into trajectory increments and accumulated over time.
-- A global search over heading bias, scale, and drift is used to compare trajectory shape under consistent alignment assumptions.
-- Because the repository includes figures instead of a full numeric log table, the analysis below focuses on convergence behavior and qualitative trajectory fidelity.
+- Same features and heading reconstruction for all methods.
+- Smooth yaw before integration.
+- Convert predicted displacement into trajectory increments.
+- Compare paths after bias, scale, and drift alignment.
 
 
 == Training Loss Comparison
@@ -185,9 +181,9 @@
   )
 ]
 
-- The loss plots are included to verify that each model can fit the scalar displacement objective.
-- In IMU-based trajectory reconstruction, low pointwise loss is necessary but not sufficient, because small displacement errors accumulate during integration.
-- The final judgment therefore combines loss behavior with the reconstructed path quality shown in the following figures.
+- Loss curves show whether each model fits the displacement target.
+- Low pointwise loss does not guarantee a good trajectory.
+- Final comparison uses reconstructed path quality.
 
 
 == Baseline and Compact Regressor
@@ -204,9 +200,9 @@
   )
 ]
 
-- The classical baseline captures the coarse turning tendency of the walker, but its fixed step length makes it sensitive to pace changes and device handling variation.
-- The compact regressor replaces the constant step assumption with learned displacement estimation, which improves adaptivity to local inertial patterns.
-- However, a pure local window model still has limited access to longer temporal dependencies, so drift can remain after long integration.
+- The baseline captures coarse turns but is sensitive to pace and pose changes.
+- CNN-MLP learns local displacement and adapts better to inertial patterns.
+- Limited long-range context still leaves drift after long integration.
 
 
 == Stride-Aware and Sequential Models
@@ -223,10 +219,9 @@
   )
 ]
 
-- The stride-aware autoregressive variant produces smoother step-to-step evolution because displacement is propagated with explicit sequential logic.
-- This design better reflects the fact that human walking is not a collection of isolated windows but a continuous process with stride-to-stride correlation.
-- The Long Short-Term Memory model further strengthens temporal continuity by maintaining hidden states over longer sequences.
-- In practice, both strategies are more suitable than the fixed-step baseline when motion speed and turning behavior vary across time.
+- AR-CNN gives smoother step-to-step predictions.
+- LSTM strengthens longer-range temporal continuity.
+- Both handle speed and turning changes better than fixed-step logic.
 
 
 == Graph-Based Motion Modeling
@@ -237,24 +232,24 @@
     [GNN]
   )
 ][
-  - Edges at `t+1`, `t+5`, and `t+10` encode local and stride-scale dependencies.
-  - The graph structure is robust to handheld signal wobble.
+- Edges at `t+1`, `t+5`, and `t+10` encode local and stride-scale dependencies.
+- The graph structure is more robust to handheld wobble.
 ]
 
 
 == Comparative Findings
 
-- The fixed-step baseline is simple and interpretable, but it is the least adaptive because step length is hand-crafted.
-- The compact learned regressor improves local displacement estimation and provides a strong lightweight baseline.
-- Adding stride-aware sequential logic produces more physically plausible trajectories because adjacent predictions become motion-consistent.
-- Long Short-Term Memory and Graph Neural Network models are better suited to learning the regularity of human motion under varying inertial conditions.
+- Fixed-step baseline: simple, interpretable, least adaptive.
+- CNN-MLP: a strong lightweight learned baseline.
+- AR-CNN, LSTM, and GNN produce more motion-consistent trajectories.
+- Temporal structure matters for IMU PDR.
 
 
 = Conclusion
 
 == Conclusion and Future Work
 
-- This project reformulates IMU-based Pedestrian Dead Reckoning as scalar displacement learning with explicit stride-aware logic.
-- The comparison shows a clear progression from fixed-step heuristics to temporal and graph-based models that better capture human motion regularity.
-- The methodological lesson is that a good inductive bias matters: step-scale targets, temporal continuity, and motion-aware reconstruction are all crucial.
-- Future work can extend this study with joint heading and displacement prediction, uncertainty-aware trajectory fusion, cross-device evaluation, and a full numeric benchmark table.
+- We reformulate IMU-PDR as scalar displacement learning.
+- Stride-aware temporal models outperform fixed-step heuristics.
+- Useful inductive bias comes from step-scale targets and temporal continuity.
+- Future work: joint heading prediction, uncertainty fusion, cross-device tests, and a full benchmark table.

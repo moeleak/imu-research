@@ -7,6 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
 import time
+from pathlib import Path
 
 # ==========================================
 # 1. 稳健的标量速度模型 (回归 v9.0 架构)
@@ -110,7 +111,7 @@ def generate_trajectory_vectorized(speeds, yaws, bias, scale, drift):
 # 4. 训练与亚米级对齐
 # ==========================================
 def train_and_break_1m():
-    root, cat = "./Dataset", "handheld"
+    root, cat = str(Path(__file__).resolve().parents[1] / "datasets"), "handheld"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     train_set = OxIODSpeedDataset(root, cat, mode='train')
