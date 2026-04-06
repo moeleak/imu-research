@@ -17,7 +17,29 @@
   caption: cap,
 )
 
-#let stacked-result-row(left-path, left-cap, right-path, right-cap, height: 9.2cm) = {
+#let stacked-result-row(left-path, left-cap, right-path, right-cap, height: 5.8cm) = {
+  v(0.1em)
+  set text(size: 0.78em)
+  grid(
+    columns: (1fr, 1fr),
+    gutter: 0.25em,
+    row-gutter: 0.1em,
+    align(center)[
+      #figure(
+        image(left-path, height: height),
+        caption: left-cap,
+      )
+    ],
+    align(center)[
+      #figure(
+        image(right-path, height: height),
+        caption: right-cap,
+      )
+    ],
+  )
+}
+
+#let stacked-wide-result-row(left-path, left-cap, right-path, right-cap, width: 100%) = {
   v(0.1em)
   grid(
     columns: (1fr, 1fr),
@@ -30,10 +52,10 @@
       #text(size: 0.66em)[#right-cap]
     ],
     align(center)[
-      #image(left-path, height: height)
+      #image(left-path, width: width)
     ],
     align(center)[
-      #image(right-path, height: height)
+      #image(right-path, width: width)
     ],
   )
 }
@@ -68,7 +90,7 @@
 - Load OxIOD handheld sequences and downsample by `4x`.
 - Build 11-D features from acceleration, gyro, attitude, and norm.
 - Train each model to predict scalar displacement.
-- Smooth yaw and suppress static intervals with ZUPT.
+- Smooth yaw with Savitzky-Golay (S-G) filtering.
 - Reconstruct trajectories with aligned bias, scale, and drift.
 
 #align(center)[
@@ -88,12 +110,12 @@
   #align(center)[
     $
       d_t &= ||p_(t+Delta) - p_t||_2 \
-      theta_t &= psi_t + b + t delta
+      theta_t &= tilde(psi)_t + b + t delta
     $
   ]
   
   #text(size: 0.85em)[
-    $d_t$: target displacement, $p_t$: ground truth position, $psi_t$: smoothed yaw.
+    $d_t$: target displacement, $p_t$: ground truth position, $tilde(psi)_t$: S-G smoothed yaw.
   ]
 ][
   #align(center)[
@@ -151,29 +173,29 @@
 - Temporal links enforce stride continuity.
 - The inductive bias is motion-aware, not coordinate-aware.
 
-== Optimization Objective
+== S-G Smoothing and Loss
 
 #slide(composer: (1fr, 1fr))[
   #align(center)[
     $
-      z_t &= I(v_t < tau) \
-      tilde(d)_t &= (1 - z_t) hat(d)_t
+      tilde(psi)_t &= sum_(k=-m)^m c_k psi_(t+k) \
+      sum_(k=-m)^m c_k &= 1
     $
   ]
   
   #text(size: 0.85em)[
-    $v_t$: local motion variance, $tau$: static threshold, $z_t$: static flag.
+    $psi_t$: raw yaw, $c_k$: S-G coefficients, $m$: half-window size.
   ]
 ][
   #align(center)[
     $
-      L &= 1/T sum_(t=1)^T rho(hat(d)_t - d_t) \
-      L_s &= 1/T sum_(t=1)^T rho(tilde(d)_t - d_t)
+      e_t &= hat(d)_t - d_t \
+      L &= 1/T sum_(t=1)^T rho(e_t)
     $
   ]
   
   #text(size: 0.85em)[
-    $rho$: robust penalty, $L$: base loss, $L_s$: loss after static suppression.
+    $e_t$: displacement residual, $rho$: robust penalty, $L$: training loss.
   ]
 ]
 
@@ -183,28 +205,27 @@
 == Evaluation Protocol
 
 - Same features and heading reconstruction for all methods.
-- Smooth yaw before integration.
+- Apply S-G yaw smoothing before integration.
 - Convert predicted displacement into trajectory increments.
 - Compare paths after bias, scale, and drift alignment.
 
 
 == Training Loss Comparison
 
-#slide(composer: (1fr, 1fr))[
-  #result-figure(
-    "assets/comparison/loss-train.png",
-    [Train loss]
-  )
-][
-  #result-figure(
-    "assets/comparison/loss-val.png",
-    [Validation loss]
-  )
+#[
+  #set text(size: 0.82em)
+  #set par(leading: 0.92em)
+  - Loss curves show whether each model fits the displacement target.
+  - Low pointwise loss does not guarantee a good trajectory.
+  - Final comparison uses reconstructed path quality.
 ]
 
-- Loss curves show whether each model fits the displacement target.
-- Low pointwise loss does not guarantee a good trajectory.
-- Final comparison uses reconstructed path quality.
+#stacked-wide-result-row(
+  "assets/comparison/loss-train.png",
+  [Train loss],
+  "assets/comparison/loss-val.png",
+  [Validation loss],
+)
 
 
 == Baseline and Compact Regressor
@@ -244,19 +265,17 @@
   height: 9.2cm,
 )
 
-
 == Graph-Based Motion Modeling
 
-#slide(composer: (1fr, 1.05fr))[
+#slide(composer: (1fr, 1fr))[
   #result-figure(
     "assets/standalone/gnn.png",
     [GNN]
   )
 ][
-- Edges at `t+1`, `t+5`, and `t+10` encode local and stride-scale dependencies.
-- The graph structure is more robust to handheld wobble.
+  - Edges at `t+1`, `t+5`, and `t+10` encode local and stride-scale dependencies.
+  - The graph structure is more robust to handheld wobble.
 ]
-
 
 == Comparative Findings
 
@@ -264,7 +283,6 @@
 - CNN-MLP: a strong lightweight learned baseline.
 - AR-CNN, LSTM, and GNN produce more motion-consistent trajectories.
 - Temporal structure matters for IMU PDR.
-
 
 = Conclusion
 

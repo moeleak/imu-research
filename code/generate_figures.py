@@ -52,6 +52,14 @@ def save_history(history: dict[str, LossHistory], output_path: Path) -> None:
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def load_history(history_path: Path) -> dict[str, LossHistory]:
+    payload = json.loads(history_path.read_text(encoding="utf-8"))
+    return {
+        model_name: LossHistory(train=curves["train"], val=curves["val"])
+        for model_name, curves in payload.items()
+    }
+
+
 def ridge_vertices(epochs: np.ndarray, losses: list[float]) -> list[tuple[float, float]]:
     return [(float(epochs[0]), 0.0), *zip(epochs.tolist(), losses), (float(epochs[-1]), 0.0)]
 
@@ -60,7 +68,6 @@ def render_surface_plot(
     history: dict[str, LossHistory],
     split: str,
     output_path: Path,
-    title: str,
     z_label: str,
 ) -> None:
     model_names = [name for name in MODEL_RENDER_ORDER if name in history]
@@ -109,7 +116,6 @@ def render_surface_plot(
             linewidth=2.4,
         )
 
-    ax.set_title(title, pad=18, fontsize=16)
     ax.set_xlim(0, DISPLAY_MAX_EPOCH)
     ax.set_ylim(-1.0, y_positions[-1] + 1.5 if len(y_positions) else 1.0)
     ax.set_zlim(0, z_max)
@@ -130,7 +136,7 @@ def render_surface_plot(
         axis.pane.set_edgecolor((0.80, 0.80, 0.80, 1.0))
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.05, top=0.90)
+    fig.subplots_adjust(left=0.02, right=0.98, bottom=0.05, top=0.98)
     fig.savefig(output_path, dpi=300, facecolor="white")
     plt.close(fig)
 
@@ -157,6 +163,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size-lstm", type=int, default=32, help="Batch size for LSTM.")
     parser.add_argument("--batch-size-gnn", type=int, default=32, help="Batch size for GNN.")
     parser.add_argument("--num-workers", type=int, default=0, help="Number of DataLoader workers.")
+    parser.add_argument(
+        "--render-loss-only",
+        action="store_true",
+        help="Redraw the loss comparison figures from an existing loss-history JSON file.",
+    )
+    parser.add_argument(
+        "--loss-history-path",
+        default=str(PROJECT_ROOT / "assets" / "comparison" / "loss-history.json"),
+        help="Path to the saved loss-history JSON used with --render-loss-only.",
+    )
     return parser.parse_args()
 
 
@@ -258,6 +274,27 @@ def shared_trajectory_limits(*trajectories: np.ndarray) -> tuple[float, float, f
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
+
+    if args.render_loss_only:
+        history_path = Path(args.loss_history_path).expanduser()
+        if not history_path.is_absolute():
+            history_path = (PROJECT_ROOT / history_path).resolve()
+        loss_history = load_history(history_path)
+        print("\n== Regenerating 3D Loss Figures ==")
+        render_surface_plot(
+            history=loss_history,
+            split="train",
+            output_path=PROJECT_ROOT / "assets" / "comparison" / "loss-train.png",
+            z_label="Training Huber Loss",
+        )
+        render_surface_plot(
+            history=loss_history,
+            split="val",
+            output_path=PROJECT_ROOT / "assets" / "comparison" / "loss-val.png",
+            z_label="Validation Huber Loss",
+        )
+        print("\n== Done ==")
+        return
 
     dataset_root = resolve_dataset_root(args.dataset_root)
     ensure_dataset_root(dataset_root, args.category)
@@ -365,14 +402,12 @@ def main() -> None:
         history=loss_history,
         split="train",
         output_path=PROJECT_ROOT / "assets" / "comparison" / "loss-train.png",
-        title="Training Loss Comparison in 3D",
         z_label="Training Huber Loss",
     )
     render_surface_plot(
         history=loss_history,
         split="val",
         output_path=PROJECT_ROOT / "assets" / "comparison" / "loss-val.png",
-        title="Validation Loss Comparison in 3D",
         z_label="Validation Huber Loss",
     )
 
