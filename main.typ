@@ -8,7 +8,7 @@
     subtitle: [A Comparative Study with Multiple Neural Models on Handheld Inertial Data],
     author: [Li X.Z., Ma J.Z., Meng H.J., Cai Z.X],
     date: datetime.today(),
-    institution: [Object-Oriented Programming Final Project],
+    institution: [Hainan Bielefeld University of Applied Sciences],
   ),
 )
 
@@ -64,7 +64,7 @@
 
 == Outline <touying:hidden>
 
-#components.adaptive-columns(outline(title: none, indent: 1em))
+#components.adaptive-columns(outline(title: none, indent: 0.1em))
 
 = Introduction
 
@@ -209,6 +209,55 @@
 - Convert predicted displacement into trajectory increments.
 - Compare paths after bias, scale, and drift alignment.
 
+
+== Environment
+
+- macOS 15.5 Apple Silicon M3 Pro
+- python 3.11.15
+
+#image("assets/output.png", width: 65%)
+
+== OOP Snapshot in Experiments
+
+#slide(composer: (1fr, 1fr))[
+  #text(size: 0.82em, weight: "semibold")[Encapsulation + Composition]
+  #set text(size: 0.54em)
+  ```python
+  @dataclass
+  class TrainedArtifact:
+      model: nn.Module
+      stats: dict[str, np.ndarray]
+      history: LossHistory | None = None
+
+  class SpeedNet(nn.Module):
+      def __init__(self, input_dim=11):
+          super().__init__()
+          self.conv = nn.Sequential(
+              nn.Conv1d(input_dim, 64, 5, padding=2),
+              nn.BatchNorm1d(64),
+              nn.ReLU(),
+              nn.AdaptiveAvgPool1d(1),
+          )
+          self.fc = nn.Sequential(nn.Flatten(), nn.Linear(64, 1))
+  ```
+][
+  #text(size: 0.82em, weight: "semibold")[Inheritance + Polymorphism]
+  #set text(size: 0.54em)
+  ```python
+  class Scalar_LSTM(nn.Module):
+      def __init__(self, input_dim=11, hidden_dim=128):
+          super().__init__()
+          self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+          self.fc = nn.Linear(hidden_dim, 1)
+
+  class Scalar_GNN(nn.Module):
+      def __init__(self, input_dim=11, hidden_dim=128):
+          super().__init__()
+          self.conv1 = GATv2Conv(input_dim, hidden_dim, heads=4)
+          self.conv2 = GATv2Conv(hidden_dim * 4, hidden_dim, heads=4)
+          self.regressor = nn.Linear(hidden_dim * 4, 1)
+  ```
+]
 
 == Training Loss Comparison
 
